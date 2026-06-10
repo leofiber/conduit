@@ -4,37 +4,63 @@ Conduit Cursor Proxy
 
 Expose Cursor Agent as a minimal OpenAI-compatible backend for opencode.
 
-This is intentionally separate from the Codex-backed conduit proxy. Cursor's
-agent is already a full agent runtime with its own tools/harness. The goal here
-is not to reimplement Cursor's tool protocol as OpenAI tool-calls; instead, we
-let Cursor perform work in the workspace and translate its structured JSON
-stream into a chat-completions shaped response so opencode can use Cursor/Kimi
-as its backend.
+Implementation: shells out to the standalone `agent` CLI in
+`--print --output-format stream-json` mode and translates the resulting NDJSON
+events into OpenAI Chat Completions responses (streaming or non-streaming).
+
+Cursor's agent is itself a full agent runtime with its own tools (read/write/
+edit/grep/ls/shell/web_search/MCP/subagents). We let Cursor perform tool
+execution in the workspace and surface its outputs to opencode as assistant
+content (and, for streaming, also as `reasoning_content` deltas for thinking
+and human-readable tool activity markers).
 
 Environment:
-  CONDUIT_CURSOR_PORT   - local listen port (default 8091)
-  CURSOR_BIN            - cursor executable (default: cursor)
-  CURSOR_MODEL          - default model when request omits model
-  CONDUIT_LOG_REQUESTS  - if "1", log inbound requests to /tmp/conduit-cursor-requests.log
+  CONDUIT_CURSOR_PORT      - local listen port (default 8091)
+  AGENT_BIN                - standalone agent executable (default: agent)
+  CURSOR_BIN               - cursor executable fallback (default: cursor)
+  CURSOR_MODEL             - default model when request omits model
+  CONDUIT_CURSOR_WORKSPACE - default workspace dir when no header is set
+  CONDUIT_LOG_REQUESTS     - if "1", log inbound requests to a temp file
+  CONDUIT_FORCE_TOOLS      - if "1" (default), pass --force to agent so all
+                              tool calls are auto-approved
 """
 
 import base64
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 
 PORT = int(os.environ.get("CONDUIT_CURSOR_PORT", "8091"))
+AGENT_BIN = os.environ.get("AGENT_BIN", "agent")
 CURSOR_BIN = os.environ.get("CURSOR_BIN", "cursor")
 DEFAULT_MODEL = os.environ.get("CURSOR_MODEL", "kimi-k2.5")
+DEFAULT_WORKSPACE = os.environ.get("CONDUIT_CURSOR_WORKSPACE") or os.getcwd()
 LOG_REQUESTS = os.environ.get("CONDUIT_LOG_REQUESTS") == "1"
 REQUEST_LOG = "/tmp/conduit-cursor-requests.log"
+FORCE_TOOLS = os.environ.get("CONDUIT_FORCE_TOOLS", "1") == "1"
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _resolve_agent_command():
+    """Prefer standalone `agent`; fall back to `cursor agent`."""
+    if shutil.which(AGENT_BIN):
+        return [AGENT_BIN]
+    if shutil.which(CURSOR_BIN):
+        return [CURSOR_BIN, "agent"]
+    return None
 
 
 def _json_body(handler, status, payload):
@@ -58,21 +84,24 @@ def _error(handler, status, message, code=None):
 
 
 def _list_models():
+    agent_cmd = _resolve_agent_command()
+    if not agent_cmd:
+        return None, "neither standalone 'agent' nor 'cursor' CLI found on PATH"
     try:
         proc = subprocess.run(
-            [CURSOR_BIN, "agent", "models"],
+            [*agent_cmd, "models"],
             capture_output=True,
             text=True,
             timeout=30,
             check=False,
         )
     except FileNotFoundError:
-        return None, "cursor CLI not found on PATH"
-    except Exception as e:
-        return None, f"failed to run cursor agent models: {e}"
+        return None, "agent CLI not found on PATH"
+    except Exception as e:  # pragma: no cover
+        return None, f"failed to run agent models: {e}"
 
     if proc.returncode != 0:
-        return None, f"cursor agent models failed: {proc.stderr.strip() or proc.stdout.strip()}"
+        return None, f"agent models failed: {proc.stderr.strip() or proc.stdout.strip()}"
 
     models = []
     for line in proc.stdout.splitlines():
@@ -90,6 +119,11 @@ def _list_models():
             "display_name": rest.replace("(current)", "").strip(),
         })
     return models, None
+
+
+# ---------------------------------------------------------------------------
+# Request -> agent prompt
+# ---------------------------------------------------------------------------
 
 
 def _save_data_url_to_file(url, workdir):
@@ -114,12 +148,11 @@ def _save_data_url_to_file(url, workdir):
         return None
 
 
-def _messages_to_cursor_prompt(messages, workdir):
-    """Collapse OpenAI-style messages into a single prompt Cursor Agent can use.
+def _messages_to_agent_prompt(messages, workdir):
+    """Collapse OpenAI-style messages into a single prompt for the agent CLI.
 
-    Cursor agent is itself an agent runtime. For this backend, we hand it a
-    structured transcript + attachment hints instead of trying to translate its
-    native tool protocol into OpenAI tool calls.
+    The agent CLI is its own full agent runtime; we hand it a structured
+    transcript plus any image attachments saved into the workspace.
     """
     system_parts = []
     transcript = []
@@ -139,7 +172,9 @@ def _messages_to_cursor_prompt(messages, workdir):
             continue
 
         if role == "tool":
-            transcript.append(f"[tool result for {msg.get('tool_call_id','unknown')}]\n{content}")
+            transcript.append(
+                f"[tool result for {msg.get('tool_call_id','unknown')}]\n{content}"
+            )
             continue
 
         if role == "assistant" and msg.get("tool_calls"):
@@ -147,7 +182,9 @@ def _messages_to_cursor_prompt(messages, workdir):
             for tc in msg["tool_calls"]:
                 fn = tc.get("function", {})
                 tc_lines.append(
-                    f"tool_call id={tc.get('id','')} name={fn.get('name','')} args={fn.get('arguments','')}"
+                    f"tool_call id={tc.get('id','')} "
+                    f"name={fn.get('name','')} "
+                    f"args={fn.get('arguments','')}"
                 )
             transcript.append("[assistant tool calls]\n" + "\n".join(tc_lines))
 
@@ -170,10 +207,17 @@ def _messages_to_cursor_prompt(messages, workdir):
                     if saved:
                         image_files.append(saved)
                         saved_files.append(saved)
+                elif ptype == "image_file":
+                    path = part.get("path") or part.get("file_path") or ""
+                    if path:
+                        image_files.append(path)
             body = "\n".join([t for t in text_chunks if t])
             if image_files:
-                body += "\n\nAttached image files in workspace:\n" + "\n".join(image_files)
-                body += "\nPlease inspect those image files directly from disk if relevant."
+                body += (
+                    "\n\nAttached image files in workspace:\n"
+                    + "\n".join(image_files)
+                    + "\nPlease inspect those image files directly from disk if relevant."
+                )
             transcript.append(f"[{role}]\n{body}")
             continue
 
@@ -183,6 +227,130 @@ def _messages_to_cursor_prompt(messages, workdir):
         prompt += f"SYSTEM INSTRUCTIONS:\n{system}\n\n"
     prompt += "CONVERSATION TRANSCRIPT:\n\n" + "\n\n".join(transcript)
     return prompt.strip(), saved_files
+
+
+# ---------------------------------------------------------------------------
+# Tool-call rendering
+# ---------------------------------------------------------------------------
+
+
+_TOOL_LABELS = {
+    "readToolCall": "Read",
+    "writeToolCall": "Write",
+    "editToolCall": "Edit",
+    "multiEditToolCall": "MultiEdit",
+    "deleteToolCall": "Delete",
+    "shellToolCall": "Shell",
+    "backgroundShellToolCall": "BackgroundShell",
+    "writeShellStdinToolCall": "WriteShellStdin",
+    "grepToolCall": "Grep",
+    "globToolCall": "Glob",
+    "lsToolCall": "Ls",
+    "fetchToolCall": "Fetch",
+    "webSearchToolCall": "WebSearch",
+    "webFetchToolCall": "WebFetch",
+    "diagnosticsToolCall": "Diagnostics",
+    "mcpToolCall": "Mcp",
+    "taskToolCall": "Task",
+    "subagentToolCall": "Subagent",
+    "askQuestionToolCall": "AskQuestion",
+    "generateImageToolCall": "GenerateImage",
+    "createPlanToolCall": "CreatePlan",
+    "executePlanToolCall": "ExecutePlan",
+    "todoWriteToolCall": "TodoWrite",
+    "setActiveBranchToolCall": "SetActiveBranch",
+    "prManagementToolCall": "PrManagement",
+    "computerUseToolCall": "ComputerUse",
+    "recordScreenToolCall": "RecordScreen",
+    "executeHookToolCall": "ExecuteHook",
+    "smartModeClassifierToolCall": "SmartModeClassifier",
+    "mcpAuthToolCall": "McpAuth",
+    "replaceEnvToolCall": "ReplaceEnv",
+    "setupVmEnvironmentToolCall": "SetupVmEnvironment",
+    "switchModeToolCall": "SwitchMode",
+}
+
+
+def _tool_label_from_event(ev):
+    tool_call = ev.get("tool_call") or {}
+    for key in tool_call:
+        if key in _TOOL_LABELS:
+            return _TOOL_LABELS[key], key
+    return "Tool", None
+
+
+def _short_args_summary(args):
+    if not isinstance(args, dict):
+        return ""
+    keys_in_order = [
+        "path",
+        "globPattern",
+        "pattern",
+        "command",
+        "url",
+        "query",
+        "name",
+        "shellId",
+        "filePath",
+        "fileText",
+        "newString",
+        "oldString",
+    ]
+    parts = []
+    for k in keys_in_order:
+        if k in args and args[k] not in (None, ""):
+            v = args[k]
+            if isinstance(v, str) and len(v) > 120:
+                v = v[:120] + "…"
+            parts.append(f"{k}={v}")
+    if not parts:
+        # Best effort: serialize a few keys.
+        for k, v in list(args.items())[:3]:
+            if isinstance(v, (str, int, float, bool)):
+                if isinstance(v, str) and len(v) > 120:
+                    v = v[:120] + "…"
+                parts.append(f"{k}={v}")
+    return ", ".join(parts)
+
+
+def _format_tool_started(ev):
+    label, key = _tool_label_from_event(ev)
+    args_block = (ev.get("tool_call") or {}).get(key, {}).get("args", {}) if key else {}
+    summary = _short_args_summary(args_block)
+    call_id = ev.get("call_id") or ""
+    line = f"\n[tool:{label}] {summary}".rstrip()
+    if call_id:
+        line += f"  (id={call_id})"
+    return line + "\n"
+
+
+def _format_tool_completed(ev):
+    label, key = _tool_label_from_event(ev)
+    call_id = ev.get("call_id") or ""
+    return f"[tool:{label}:done id={call_id}]\n"
+
+
+# ---------------------------------------------------------------------------
+# OpenAI streaming helpers
+# ---------------------------------------------------------------------------
+
+
+def _sse_chunk(handler, payload_json):
+    data = f"data: {payload_json}\n\n".encode()
+    handler.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
+    handler.wfile.flush()
+
+
+def _sse_done(handler):
+    final = b"data: [DONE]\n\n"
+    handler.wfile.write(f"{len(final):x}\r\n".encode() + final + b"\r\n")
+    handler.wfile.write(b"0\r\n\r\n")
+    handler.wfile.flush()
+
+
+# ---------------------------------------------------------------------------
+# HTTP handler
+# ---------------------------------------------------------------------------
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -200,6 +368,8 @@ class Handler(BaseHTTPRequestHandler):
             print(f"request handler error: {e}")
             self.close_connection = True
 
+    # -- GET ----------------------------------------------------------------
+
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/v1/models":
@@ -207,15 +377,20 @@ class Handler(BaseHTTPRequestHandler):
             if err:
                 return _error(self, 500, err)
             return _json_body(self, 200, {"object": "list", "data": models})
+        if path == "/healthz":
+            return _json_body(self, 200, {"status": "ok"})
         return _error(self, 404, "Not found")
+
+    # -- POST ---------------------------------------------------------------
 
     def do_POST(self):
         path = urlparse(self.path).path
         if path != "/v1/chat/completions":
             return _error(self, 404, "Not found")
 
-        if not shutil.which(CURSOR_BIN):
-            return _error(self, 500, f"Cursor CLI not found: {CURSOR_BIN}")
+        agent_cmd = _resolve_agent_command()
+        if not agent_cmd:
+            return _error(self, 500, "Neither standalone 'agent' nor 'cursor' CLI found on PATH")
 
         content_length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(content_length)
@@ -237,12 +412,19 @@ class Handler(BaseHTTPRequestHandler):
         model = req.get("model") or DEFAULT_MODEL
         client_stream = bool(req.get("stream", False))
         messages = req.get("messages", [])
-        workdir = os.getcwd()
-        prompt, temp_files = _messages_to_cursor_prompt(messages, workdir)
+        workdir = (
+            self.headers.get("X-Conduit-Workspace")
+            or req.get("workspace")
+            or (req.get("metadata") or {}).get("workspace")
+            or req.get("user")
+            or DEFAULT_WORKSPACE
+        )
+        if not isinstance(workdir, str) or not os.path.isdir(workdir):
+            workdir = DEFAULT_WORKSPACE
+        prompt, temp_files = _messages_to_agent_prompt(messages, workdir)
 
         cmd = [
-            CURSOR_BIN,
-            "agent",
+            *agent_cmd,
             "--print",
             "--output-format",
             "stream-json",
@@ -251,8 +433,10 @@ class Handler(BaseHTTPRequestHandler):
             workdir,
             "--model",
             model,
-            prompt,
         ]
+        if FORCE_TOOLS:
+            cmd.append("--force")
+        cmd.append(prompt)
 
         try:
             proc = subprocess.Popen(
@@ -261,11 +445,12 @@ class Handler(BaseHTTPRequestHandler):
                 stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,
+                cwd=workdir,
             )
         except Exception as e:
-            return _error(self, 500, f"failed to start Cursor agent: {e}")
+            return _error(self, 500, f"failed to start agent: {e}")
 
-        response_id = f"chatcmpl-{int(time.time()*1000)}"
+        response_id = f"chatcmpl-{int(time.time()*1000)}-{uuid.uuid4().hex[:6]}"
         created_ts = int(time.time())
         full_text = ""
         reasoning = ""
@@ -285,42 +470,40 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "keep-alive")
             self.end_headers()
 
-            def write_chunk(payload):
-                if isinstance(payload, str):
-                    payload = payload.encode()
-                chunk = f"{len(payload):x}\r\n".encode() + payload + b"\r\n"
-                self.wfile.write(chunk)
-                self.wfile.flush()
-
-            def write_done():
-                self.wfile.write(b"0\r\n\r\n")
-                self.wfile.flush()
-
             initial = {
                 "id": response_id,
                 "object": "chat.completion.chunk",
                 "created": created_ts,
                 "model": model,
-                "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
+                "choices": [{
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": ""},
+                    "finish_reason": None,
+                }],
             }
             try:
-                write_chunk(f"data: {json.dumps(initial)}\n\n")
+                _sse_chunk(self, json.dumps(initial))
             except Exception:
                 proc.kill()
+                self._cleanup(temp_files)
                 return
+
+        # Read stderr asynchronously so we can surface errors without
+        # blocking on stdout.
+        stderr_buf = []
 
         def read_stderr_async(p, bucket):
             try:
-                stderr = p.stderr.read()
-                if stderr:
-                    bucket.append(stderr)
+                err = p.stderr.read()
+                if err:
+                    bucket.append(err)
             except Exception:
                 pass
 
-        stderr_buf = []
         t = threading.Thread(target=read_stderr_async, args=(proc, stderr_buf), daemon=True)
         t.start()
 
+        finished_normally = False
         try:
             for line in proc.stdout:
                 line = line.strip()
@@ -330,9 +513,10 @@ class Handler(BaseHTTPRequestHandler):
                     ev = json.loads(line)
                 except Exception:
                     continue
-
                 etype = ev.get("type")
-                if etype == "thinking" and ev.get("subtype") == "delta":
+                subtype = ev.get("subtype")
+
+                if etype == "thinking" and subtype == "delta":
                     delta = ev.get("text", "")
                     reasoning += delta
                     if client_stream:
@@ -341,26 +525,85 @@ class Handler(BaseHTTPRequestHandler):
                             "object": "chat.completion.chunk",
                             "created": created_ts,
                             "model": model,
-                            "choices": [{"index": 0, "delta": {"reasoning_content": delta, "reasoning": delta}, "finish_reason": None}],
+                            "choices": [{
+                                "index": 0,
+                                "delta": {
+                                    "reasoning_content": delta,
+                                    "reasoning": delta,
+                                },
+                                "finish_reason": None,
+                            }],
                         }
-                        write_chunk(f"data: {json.dumps(chunk)}\n\n")
-                elif etype == "assistant":
-                    content = ""
+                        try:
+                            _sse_chunk(self, json.dumps(chunk))
+                        except Exception:
+                            proc.kill()
+                            self._cleanup(temp_files)
+                            return
+                    continue
+
+                if etype == "tool_call":
+                    if subtype == "started":
+                        marker = _format_tool_started(ev)
+                    elif subtype == "completed":
+                        marker = _format_tool_completed(ev)
+                    else:
+                        marker = ""
+                    if marker:
+                        reasoning += marker
+                        if client_stream:
+                            chunk = {
+                                "id": response_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_ts,
+                                "model": model,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {
+                                        "reasoning_content": marker,
+                                        "reasoning": marker,
+                                    },
+                                    "finish_reason": None,
+                                }],
+                            }
+                            try:
+                                _sse_chunk(self, json.dumps(chunk))
+                            except Exception:
+                                proc.kill()
+                                self._cleanup(temp_files)
+                                return
+                    continue
+
+                if etype == "assistant":
                     msg = ev.get("message") or {}
-                    for part in msg.get("content", []):
-                        if part.get("type") == "text":
-                            content += part.get("text", "")
-                    full_text += content
-                    if client_stream and content:
-                        chunk = {
-                            "id": response_id,
-                            "object": "chat.completion.chunk",
-                            "created": created_ts,
-                            "model": model,
-                            "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
-                        }
-                        write_chunk(f"data: {json.dumps(chunk)}\n\n")
-                elif etype == "result":
+                    content_pieces = []
+                    for part in msg.get("content", []) or []:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            content_pieces.append(part.get("text", ""))
+                    content = "".join(content_pieces)
+                    if content:
+                        full_text += content
+                        if client_stream:
+                            chunk = {
+                                "id": response_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_ts,
+                                "model": model,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"content": content},
+                                    "finish_reason": None,
+                                }],
+                            }
+                            try:
+                                _sse_chunk(self, json.dumps(chunk))
+                            except Exception:
+                                proc.kill()
+                                self._cleanup(temp_files)
+                                return
+                    continue
+
+                if etype == "result":
                     u = ev.get("usage") or {}
                     usage = {
                         "prompt_tokens": u.get("inputTokens", 0),
@@ -369,17 +612,59 @@ class Handler(BaseHTTPRequestHandler):
                         "prompt_tokens_details": {"cached_tokens": u.get("cacheReadTokens", 0)},
                         "completion_tokens_details": {"reasoning_tokens": 0},
                     }
+                    # If for some reason no assistant text was emitted but a
+                    # final string was provided, fall back to it.
+                    if not full_text and isinstance(ev.get("result"), str):
+                        full_text = ev["result"]
+                        if client_stream:
+                            chunk = {
+                                "id": response_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_ts,
+                                "model": model,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"content": full_text},
+                                    "finish_reason": None,
+                                }],
+                            }
+                            try:
+                                _sse_chunk(self, json.dumps(chunk))
+                            except Exception:
+                                pass
+                    continue
+
+            finished_normally = True
         finally:
-            rc = proc.wait(timeout=10)
-            for p in temp_files:
+            try:
+                rc = proc.wait(timeout=10)
+            except Exception:
+                rc = -1
+            self._cleanup(temp_files)
+
+        if not finished_normally and rc != 0 and not full_text:
+            err_text = "\n".join(stderr_buf).strip() or f"agent exited with status {rc}"
+            if client_stream:
+                # Emit an error chunk so opencode sees something useful.
+                err_chunk = {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_ts,
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": f"\n[conduit error] {err_text}\n"},
+                        "finish_reason": "stop",
+                    }],
+                    "usage": usage,
+                }
                 try:
-                    os.unlink(p)
+                    _sse_chunk(self, json.dumps(err_chunk))
+                    _sse_done(self)
                 except Exception:
                     pass
-
-        stderr_text = "\n".join(stderr_buf).strip()
-        if rc != 0:
-            return _error(self, 500, stderr_text or f"Cursor agent exited with status {rc}")
+                return
+            return _error(self, 500, err_text)
 
         if client_stream:
             final = {
@@ -391,9 +676,8 @@ class Handler(BaseHTTPRequestHandler):
                 "usage": usage,
             }
             try:
-                write_chunk(f"data: {json.dumps(final)}\n\n")
-                write_chunk(b"data: [DONE]\n\n")
-                write_done()
+                _sse_chunk(self, json.dumps(final))
+                _sse_done(self)
             except Exception:
                 pass
             return
@@ -412,15 +696,25 @@ class Handler(BaseHTTPRequestHandler):
         }
         return _json_body(self, 200, payload)
 
+    # -- helpers ------------------------------------------------------------
+
+    def _cleanup(self, temp_files):
+        for p in temp_files or []:
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
+
 
 def main():
-    if not shutil.which(CURSOR_BIN):
-        print(f"⚠  Cursor CLI not found on PATH: {CURSOR_BIN}")
-        print("   Install Cursor and ensure `cursor` is on PATH before starting this proxy.")
+    agent_cmd = _resolve_agent_command()
+    if not agent_cmd:
+        print(f"⚠  Neither '{AGENT_BIN}' nor '{CURSOR_BIN}' is available on PATH")
+        print("   Install Cursor Agent / Cursor CLI and ensure the command is on PATH before starting this proxy.")
     else:
         print(f"✓ Conduit Cursor proxy listening on http://localhost:{PORT}")
         print(f"  OpenAI-compatible base URL: http://localhost:{PORT}/v1")
-        print(f"  Backend: Cursor Agent ({CURSOR_BIN})")
+        print(f"  Backend: Cursor Agent ({' '.join(agent_cmd)})")
 
     server = ThreadingHTTPServer(("localhost", PORT), Handler)
     try:

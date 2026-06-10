@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.leofiber.conduit</string>
+    <string>com.leofiber.conduit-cursor</string>
 
     <key>ProgramArguments</key>
     <array>
@@ -11,11 +11,9 @@
         <string>__PROXY_PATH__</string>
     </array>
 
-    <!-- Run at login -->
     <key>RunAtLoad</key>
     <true/>
 
-    <!-- Auto-restart on crash, but not on graceful exit -->
     <key>KeepAlive</key>
     <dict>
         <key>SuccessfulExit</key>
@@ -24,7 +22,6 @@
         <true/>
     </dict>
 
-    <!-- Don't restart faster than once every 10 seconds -->
     <key>ThrottleInterval</key>
     <integer>10</integer>
 
@@ -32,10 +29,10 @@
     <string>__HOME__</string>
 
     <key>StandardOutPath</key>
-    <string>/tmp/conduit.log</string>
+    <string>/tmp/conduit-cursor.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/tmp/conduit.log</string>
+    <string>/tmp/conduit-cursor.log</string>
 
     <key>EnvironmentVariables</key>
     <dict>
@@ -43,8 +40,10 @@
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
         <key>HOME</key>
         <string>__HOME__</string>
-        <key>CONDUIT_PORT</key>
+        <key>CONDUIT_CURSOR_PORT</key>
         <string>__PORT__</string>
+        <key>CONDUIT_CURSOR_WORKSPACE</key>
+        <string>__HOME__</string>
     </dict>
 
     <key>ProcessType</key>

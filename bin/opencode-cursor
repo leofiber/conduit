@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROXY_PORT="${CONDUIT_CURSOR_PORT:-8091}"
+LAUNCHD_LABEL="com.leofiber.conduit-cursor"
+PROXY_PLIST="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
+PROXY_LOG="${CONDUIT_CURSOR_LOG:-/tmp/conduit-cursor.log}"
+
+log() { printf '\033[2m[conduit-cursor]\033[0m %s\n' "$*" >&2; }
+err() { printf '\033[31m[conduit-cursor]\033[0m %s\n' "$*" >&2; }
+
+proxy_healthy() {
+    lsof -i ":$PROXY_PORT" -sTCP:LISTEN >/dev/null 2>&1 || return 1
+    curl -s --max-time 3 "http://localhost:$PROXY_PORT/v1/models" 2>/dev/null | grep -q "kimi-k2.5" || return 1
+    return 0
+}
+
+ensure_launchd_proxy() {
+    if [ ! -f "$PROXY_PLIST" ]; then
+        err "launchd plist not found at $PROXY_PLIST"
+        return 1
+    fi
+    if ! launchctl list | grep -q "$LAUNCHD_LABEL"; then
+        log "loading launchd job $LAUNCHD_LABEL"
+        launchctl load "$PROXY_PLIST" 2>/dev/null || true
+    else
+        log "kickstarting launchd job $LAUNCHD_LABEL"
+        launchctl kickstart -k "gui/$(id -u)/$LAUNCHD_LABEL" 2>/dev/null || \
+            launchctl start "$LAUNCHD_LABEL" 2>/dev/null || true
+    fi
+}
+
+cursor_logged_in() {
+    command -v cursor >/dev/null 2>&1 || return 1
+    cursor agent status >/dev/null 2>&1
+}
+
+cursor_login() {
+    command -v cursor >/dev/null 2>&1 || {
+        err "Cursor CLI not found. Install Cursor and ensure 'cursor' is on PATH."
+        return 1
+    }
+    log "Cursor auth missing - launching 'cursor agent login'..."
+    cursor agent login
+}
+
+if ! cursor_logged_in; then
+    cursor_login || { err "could not authenticate with Cursor"; exit 1; }
+fi
+
+if ! proxy_healthy; then
+    log "Cursor proxy not healthy - starting via launchd"
+    ensure_launchd_proxy || true
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+        sleep 1
+        proxy_healthy && break
+    done
+    if ! proxy_healthy; then
+        err "Cursor proxy didn't come up. Last 30 log lines from $PROXY_LOG:"
+        tail -30 "$PROXY_LOG" >&2 2>/dev/null || true
+        exit 1
+    fi
+fi
+
+exec opencode "$@"
