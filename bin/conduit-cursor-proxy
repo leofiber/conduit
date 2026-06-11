@@ -26,6 +26,7 @@ Environment:
 """
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -47,6 +48,16 @@ DEFAULT_WORKSPACE = os.environ.get("CONDUIT_CURSOR_WORKSPACE") or os.getcwd()
 LOG_REQUESTS = os.environ.get("CONDUIT_LOG_REQUESTS") == "1"
 REQUEST_LOG = "/tmp/conduit-cursor-requests.log"
 FORCE_TOOLS = os.environ.get("CONDUIT_FORCE_TOOLS", "1") == "1"
+SHORTCIRCUIT_TITLES = os.environ.get("CONDUIT_SHORTCIRCUIT_TITLES", "1") == "1"
+RESUME_SESSIONS = os.environ.get("CONDUIT_RESUME_SESSIONS", "1") == "1"
+
+# Cache: hash(prior turns) -> last cursor-agent session id we got back. Used so
+# follow-up turns in the same conversation can `--resume <id>` and only send
+# the latest user message instead of cold-spawning a fresh agent that has to
+# re-read the entire transcript.
+_SESSION_CACHE = {}
+_SESSION_CACHE_LOCK = threading.Lock()
+_SESSION_CACHE_MAX = 256
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +338,190 @@ def _format_tool_started(ev):
 def _format_tool_completed(ev):
     label, key = _tool_label_from_event(ev)
     call_id = ev.get("call_id") or ""
+
+
+# ---------------------------------------------------------------------------
+# Latency fast paths
+# ---------------------------------------------------------------------------
+
+
+def _is_title_request(req, messages):
+    """Detect opencode's "title generator" side-call so we don't spawn a whole
+    Cursor turn just to come up with a thread label.
+
+    opencode hard-codes the system prompt: "You are a title generator. You
+    output ONLY a thread title. Nothing else." We pattern-match on that.
+    """
+    if not SHORTCIRCUIT_TITLES:
+        return False
+    try:
+        sys_msgs = [m.get("content", "") for m in messages if m.get("role") == "system"]
+    except Exception:
+        return False
+    for content in sys_msgs:
+        if isinstance(content, list):
+            content = " ".join(
+                p.get("text", "") for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            )
+        if isinstance(content, str) and "title generator" in content.lower():
+            return True
+    return False
+
+
+def _synth_title(messages):
+    last_user = ""
+    for m in messages:
+        if m.get("role") == "user":
+            c = m.get("content")
+            if isinstance(c, str):
+                last_user = c
+            elif isinstance(c, list):
+                last_user = " ".join(
+                    p.get("text", "") for p in c
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+    last_user = re.sub(r"\s+", " ", last_user).strip().strip('"').strip()
+    if not last_user:
+        return "New conversation"
+    title = last_user[:50].rstrip()
+    if len(last_user) > 50:
+        title = title.rstrip(",.;:- ") + "…"
+    return title
+
+
+def _serve_title(handler, req, messages, response_id, created_ts, model):
+    """Return a synthetic completion for opencode's title side-call without
+    touching Cursor."""
+    title = _synth_title(messages)
+    usage = {
+        "prompt_tokens": 0,
+        "completion_tokens": len(title.split()),
+        "total_tokens": len(title.split()),
+        "prompt_tokens_details": {"cached_tokens": 0},
+        "completion_tokens_details": {"reasoning_tokens": 0},
+    }
+    if bool(req.get("stream", False)):
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream")
+        handler.send_header("Cache-Control", "no-cache")
+        handler.send_header("Transfer-Encoding", "chunked")
+        handler.send_header("Connection", "keep-alive")
+        handler.end_headers()
+        initial = {
+            "id": response_id, "object": "chat.completion.chunk",
+            "created": created_ts, "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": title},
+                "finish_reason": None,
+            }],
+        }
+        final = {
+            "id": response_id, "object": "chat.completion.chunk",
+            "created": created_ts, "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": usage,
+        }
+        try:
+            _sse_chunk(handler, json.dumps(initial))
+            _sse_chunk(handler, json.dumps(final))
+            _sse_done(handler)
+        except Exception:
+            pass
+        return
+    payload = {
+        "id": response_id, "object": "chat.completion",
+        "created": created_ts, "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": title},
+            "finish_reason": "stop",
+        }],
+        "usage": usage,
+    }
+    return _json_body(handler, 200, payload)
+
+
+def _hash_messages(messages):
+    """Stable hash of all but the last user message - identifies a conversation
+    so follow-up turns can resume the same Cursor session."""
+    if not messages:
+        return None
+    cutoff = len(messages)
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "user":
+            cutoff = i
+            break
+    if cutoff == 0:
+        return None
+    h = hashlib.sha256()
+    for m in messages[:cutoff]:
+        try:
+            h.update(json.dumps(m, sort_keys=True, default=str).encode())
+            h.update(b"\x1f")
+        except Exception:
+            pass
+    return h.hexdigest()
+
+
+def _last_user_message_text(messages, workdir):
+    """Return the text of the most recent user message, with images saved to
+    workspace and referenced inline (matches the format the existing transcript
+    builder uses)."""
+    last = None
+    for m in messages:
+        if m.get("role") == "user":
+            last = m
+    if last is None:
+        return "", []
+    saved = []
+    content = last.get("content", "")
+    if isinstance(content, str):
+        return content, saved
+    chunks = []
+    images = []
+    for part in content if isinstance(content, list) else []:
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get("type")
+        if ptype == "text":
+            chunks.append(part.get("text", ""))
+        elif ptype == "image_url":
+            url = (part.get("image_url") or {}).get("url", "")
+            p = _save_data_url_to_file(url, workdir)
+            if p:
+                images.append(p)
+                saved.append(p)
+        elif ptype == "image_file":
+            p = part.get("path") or part.get("file_path") or ""
+            if p:
+                images.append(p)
+    body = "\n".join(t for t in chunks if t)
+    if images:
+        body += (
+            "\n\nAttached image files in workspace:\n"
+            + "\n".join(images)
+            + "\nPlease inspect those image files directly from disk if relevant."
+        )
+    return body, saved
+
+
+def _cache_session(conv_hash, session_id):
+    if not (RESUME_SESSIONS and conv_hash and session_id):
+        return
+    with _SESSION_CACHE_LOCK:
+        _SESSION_CACHE[conv_hash] = session_id
+        if len(_SESSION_CACHE) > _SESSION_CACHE_MAX:
+            for k in list(_SESSION_CACHE)[: len(_SESSION_CACHE) - _SESSION_CACHE_MAX]:
+                _SESSION_CACHE.pop(k, None)
+
+
+def _lookup_session(conv_hash):
+    if not (RESUME_SESSIONS and conv_hash):
+        return None
+    with _SESSION_CACHE_LOCK:
+        return _SESSION_CACHE.get(conv_hash)
     return f"[tool:{label}:done id={call_id}]\n"
 
 
@@ -412,6 +607,14 @@ class Handler(BaseHTTPRequestHandler):
         model = req.get("model") or DEFAULT_MODEL
         client_stream = bool(req.get("stream", False))
         messages = req.get("messages", [])
+        response_id = f"chatcmpl-{int(time.time()*1000)}-{uuid.uuid4().hex[:6]}"
+        created_ts = int(time.time())
+
+        # Fast path #1: opencode's per-thread title side-call. Don't burn a
+        # whole Cursor turn (~10s cold spawn) just to come up with a label.
+        if _is_title_request(req, messages):
+            return _serve_title(self, req, messages, response_id, created_ts, model)
+
         workdir = (
             self.headers.get("X-Conduit-Workspace")
             or req.get("workspace")
@@ -421,7 +624,18 @@ class Handler(BaseHTTPRequestHandler):
         )
         if not isinstance(workdir, str) or not os.path.isdir(workdir):
             workdir = DEFAULT_WORKSPACE
-        prompt, temp_files = _messages_to_agent_prompt(messages, workdir)
+
+        # Fast path #2: if we've already driven this exact conversation prefix
+        # through Cursor before, reuse the cursor-agent session id and just
+        # send the latest user turn instead of replaying the whole transcript.
+        conv_hash = _hash_messages(messages)
+        resume_id = _lookup_session(conv_hash)
+        if resume_id:
+            prompt, temp_files = _last_user_message_text(messages, workdir)
+            if not prompt.strip():
+                resume_id = None
+        if not resume_id:
+            prompt, temp_files = _messages_to_agent_prompt(messages, workdir)
 
         cmd = [
             *agent_cmd,
@@ -436,6 +650,8 @@ class Handler(BaseHTTPRequestHandler):
         ]
         if FORCE_TOOLS:
             cmd.append("--force")
+        if resume_id:
+            cmd += ["--resume", resume_id]
         cmd.append(prompt)
 
         try:
@@ -450,10 +666,9 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             return _error(self, 500, f"failed to start agent: {e}")
 
-        response_id = f"chatcmpl-{int(time.time()*1000)}-{uuid.uuid4().hex[:6]}"
-        created_ts = int(time.time())
         full_text = ""
         reasoning = ""
+        agent_session_id = None
         usage = {
             "prompt_tokens": 0,
             "completion_tokens": 0,
@@ -515,6 +730,12 @@ class Handler(BaseHTTPRequestHandler):
                     continue
                 etype = ev.get("type")
                 subtype = ev.get("subtype")
+
+                if etype == "system" and subtype == "init":
+                    sid = ev.get("session_id")
+                    if isinstance(sid, str) and sid:
+                        agent_session_id = sid
+                    continue
 
                 if etype == "thinking" and subtype == "delta":
                     delta = ev.get("text", "")
@@ -604,6 +825,9 @@ class Handler(BaseHTTPRequestHandler):
                     continue
 
                 if etype == "result":
+                    sid = ev.get("session_id")
+                    if isinstance(sid, str) and sid:
+                        agent_session_id = sid
                     u = ev.get("usage") or {}
                     usage = {
                         "prompt_tokens": u.get("inputTokens", 0),
@@ -641,6 +865,22 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 rc = -1
             self._cleanup(temp_files)
+
+        # Cache the cursor-agent session id so a follow-up turn in this
+        # conversation can `--resume <id>` and skip re-sending the transcript.
+        if conv_hash and agent_session_id and full_text:
+            # Index by both the prefix-hash (for follow-ups: prior turns) and
+            # the inclusive-hash (so a chat that replays the same prefix again
+            # still resumes correctly).
+            _cache_session(conv_hash, agent_session_id)
+            try:
+                inclusive = hashlib.sha256()
+                for m in messages:
+                    inclusive.update(json.dumps(m, sort_keys=True, default=str).encode())
+                    inclusive.update(b"\x1f")
+                _cache_session(inclusive.hexdigest(), agent_session_id)
+            except Exception:
+                pass
 
         if not finished_normally and rc != 0 and not full_text:
             err_text = "\n".join(stderr_buf).strip() or f"agent exited with status {rc}"
