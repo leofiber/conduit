@@ -1,28 +1,75 @@
-# Conduit
+# Conduit (Cursor edition)
 
 ```
-                       __     _ __
-   _______  ___  ___/ /_ __(_) /_
-  / __/ _ \/ _ \/ _  / // / / __/
-  \__/\___/_//_/\_,_/\_,_/_/\__/
+                   ____                             __
+  _______  _______/ __ \____ ___  _________  _____/ /
+ / ___/ / / / ___/ / / / __ `/ / / / ___/ / / / __/
+/ /__/ /_/ / /  / /_/ / /_/ / /_/ / /  / /_/ / /_
+\___/\__,_/_/   \____/\__,_/\__,_/_/   \__,_/\__/
 
-   ▸▸▸  codex auth → openai-compat  ▸▸▸
+   ▸▸▸  cursor agent auth → opencode harness  ▸▸▸
 ```
 
-> Bridge your ChatGPT Business / Enterprise Codex auth into any OpenAI-compatible tool.
+Use your native **Cursor Agent** auth and models (Kimi K2.5, Composer 2.5,
+Gemini 3 Flash, Auto) through the **opencode** UI.
 
-If you have a ChatGPT Business or Enterprise plan, you already have Codex access — but Codex's tokens are scoped for Codex's private backend, **not** the public OpenAI API. So you can't drop your Codex login into [opencode](https://opencode.ai), Continue, Cursor BYOK, or anything else.
+Conduit runs a small local adapter on `http://localhost:8091/v1` that:
 
-Conduit fixes that. It runs a tiny local proxy that:
+- speaks OpenAI-style `POST /v1/chat/completions`
+- shells out to `agent --print --output-format stream-json` for each turn
+- translates Cursor's NDJSON event stream into OpenAI-compatible streaming
+  chunks (assistant text + reasoning deltas + tool activity markers)
+- preserves Cursor's auth, billing/usage, and model selection
 
-- Reads your `~/.codex/auth.json` (created by `codex login`)
-- Speaks the standard **OpenAI Chat Completions API** (`/v1/chat/completions`, `/v1/models`)
-- Forwards each request to `https://chatgpt.com/backend-api/codex/responses` using your tokens
-- Translates the Responses API event stream back into Chat Completions SSE chunks (with proper `tool_calls`, `reasoning_content`, `usage`)
-- Auto-refreshes expired tokens; if refresh fails, falls back to interactive `codex login`
-- Surfaces real model metadata (context window, modalities, supported reasoning levels) live from Codex's `/models` endpoint
+This repo is **Cursor-specific**.
 
-The result: any OpenAI-compatible tool can use **gpt-5.5**, **gpt-5.4 (1M context)**, etc. — billed against your existing Business/Enterprise plan.
+## What works today
+
+End-to-end through `opencode` against the cursor-proxy provider, verified by
+`tests/e2e.sh`:
+
+| category                | tool surface                               | status |
+| ----------------------- | ------------------------------------------ | ------ |
+| plain chat              | text + reasoning deltas + usage            | ok     |
+| file read               | Cursor `Read` tool                         | ok     |
+| file write + run        | Cursor `Write` + `Shell`                   | ok     |
+| file edit               | Cursor `Edit`                              | ok     |
+| grep / glob / ls        | Cursor `Grep`, `Glob`, `Ls`                | ok     |
+| delete                  | Cursor `Delete`                            | ok     |
+| web fetch               | Cursor `WebFetch` / `Fetch`                | ok     |
+| subagent / task         | Cursor `Task` / subagent                   | ok     |
+| MCP servers             | any Cursor-loaded MCP (`~/.cursor/mcp.json` or workspace `.cursor/mcp.json`) | ok |
+| inline images           | passed through as workspace files          | ok     |
+
+Reasoning is surfaced as OpenAI `reasoning_content` deltas. Tool activity is
+surfaced as inline `[tool:Name] args (id=...)` markers in the same channel so
+opencode shows you what Cursor is doing per turn.
+
+## Architecture
+
+```
+            ┌────────────┐  HTTP /v1/chat/completions   ┌──────────────────────┐
+opencode ───▶ Conduit Cursor Proxy ───spawns subprocess▶ agent --print
+            │ (Python, port 8091)                      │  --output-format     │
+            └────────────┘ ◀── NDJSON stream-json ─────┤  stream-json         │
+                                                       └──────────────────────┘
+```
+
+Cursor Agent is the **tool runner** for this turn. The proxy:
+
+- builds a single prompt from opencode's OpenAI-style messages (system +
+  transcript + tool transcript)
+- saves any inline image data-URLs into the workspace and references them
+- spawns `agent --print --output-format stream-json --trust --force --workspace
+  <ws> --model <id>` with `cwd=<ws>` so workspace `.cursor/mcp.json` is found
+- maps Cursor's events to OpenAI Chat Completions:
+  - `thinking.delta` ➝ `delta.reasoning_content`
+  - `tool_call` started/completed ➝ `delta.reasoning_content` markers
+  - `assistant` text content ➝ `delta.content`
+  - `result` ➝ final chunk + `usage`
+- supports both streaming (`stream:true`) and non-streaming responses
+- reports real `prompt_tokens` / `completion_tokens` / `cached_tokens` from
+  Cursor's `result.usage`
 
 ## Quickstart
 
@@ -30,115 +77,71 @@ The result: any OpenAI-compatible tool can use **gpt-5.5**, **gpt-5.4 (1M contex
 curl -fsSL https://raw.githubusercontent.com/leofiber/conduit/main/install.sh | bash
 ```
 
-The installer will:
+The installer:
 
-1. Verify Homebrew is installed (it'll ask you to install it first if not — Conduit can't help with that)
-2. Install [`codex`](https://github.com/openai/codex) and [`opencode`](https://opencode.ai) via brew if missing
-3. Run `codex login` if you're not already authenticated (browser-based SSO works)
-4. Drop the proxy + a wrapper into `~/.local/bin`
-5. Register a `launchd` agent so the proxy runs at login and auto-restarts on crash
-6. Add a `codex-proxy` provider to your `~/.config/opencode/opencode.json` (merging — your other providers are untouched)
-7. Smoke-test the whole stack
+1. checks that `brew` exists (required)
+2. requires either the standalone `agent` CLI or `cursor` CLI on PATH
+3. installs `opencode` if missing
+4. runs `agent login` (or `cursor agent login`) if you're not authenticated
+5. installs `conduit-cursor-proxy` and `conduit-cursor-run` into `~/.local/bin`
+6. registers a `launchd` agent so the proxy auto-starts at login and on crash
+7. adds a `cursor-proxy` provider into your opencode config
 
-After install, just run:
-
-```bash
-opencode --model codex-proxy/gpt-5.5
-```
-
-## What you get
-
-| Feature | Status |
-|---|---|
-| Streaming chat completions | ✅ |
-| Tool / function calling (with multi-turn) | ✅ |
-| Image inputs (data URLs) | ✅ |
-| Reasoning streams (`reasoning_content` deltas) | ✅ |
-| Real token usage in `usage` field | ✅ |
-| Live model metadata via `/v1/models` | ✅ |
-| Token auto-refresh | ✅ |
-| Browser fallback when refresh fails | ✅ |
-| Survives reboot / crash (launchd) | ✅ |
-
-## Models
-
-Conduit fetches the authoritative model list from Codex on every cold start. As of today:
-
-| Model | Context | Notes |
-|---|---|---|
-| `gpt-5.5` | 272K | Frontier model, default `reasoning_effort: xhigh` |
-| `gpt-5.4` | up to **1M** | Strong everyday coding model, the only one with 1M context |
-| `gpt-5.4-mini` | 272K | Faster, cheaper |
-
-In opencode, address them as `codex-proxy/gpt-5.5`, `codex-proxy/gpt-5.4`, etc.
-
-## How it works
-
-```
-┌─────────────────┐                ┌───────────────┐               ┌─────────────────────────┐
-│  opencode       │  POST /v1/chat │  Conduit      │  POST /codex/ │  chatgpt.com            │
-│  (or any        │ ─────────────► │  localhost:   │  responses    │  /backend-api/codex     │
-│   OpenAI-compat │                │  8081         │ ────────────► │  (your tokens)          │
-│   tool)         │ ◄───────────── │               │ ◄──────────── │                         │
-└─────────────────┘   SSE chunks   └───────────────┘   SSE chunks  └─────────────────────────┘
-                      (Chat                            (Responses
-                       Completions                      API events)
-                       format)
-```
-
-The proxy:
-- **Translates message format** — Chat Completions `messages[]` ↔ Responses API `input[]` items, including `tool_calls` ↔ `function_call`, tool results ↔ `function_call_output`, and `image_url` ↔ `input_image`.
-- **Tracks streaming state** — emits `finish_reason: tool_calls` correctly when the model invoked a tool (otherwise you get duplicated assistant turns in the UI).
-- **Surfaces real usage** — extracts `input_tokens` / `output_tokens` / `cached_tokens` / `reasoning_tokens` from the `response.completed` event and emits them in the OpenAI `usage` field.
-- **Refreshes tokens silently** — uses `refresh_token` grant against `auth.openai.com/oauth/token`. Updates `~/.codex/auth.json` in place, the same file `codex` uses, so the two tools stay in sync.
-
-## Files
-
-| Path | Purpose |
-|---|---|
-| `~/.local/bin/conduit-proxy` | The Python proxy |
-| `~/.local/bin/opencode-codex` | Wrapper that ensures auth + proxy are healthy before launching opencode |
-| `~/Library/LaunchAgents/com.leofiber.conduit.plist` | launchd agent definition |
-| `~/.codex/auth.json` | Your Codex tokens (created by `codex login`, used by Conduit) |
-| `/tmp/conduit.log` | Proxy logs |
-| `~/.config/opencode/opencode.json` | opencode config (Conduit adds the `codex-proxy` provider) |
-
-## Manual control
+Then run:
 
 ```bash
-# Stop / start
-launchctl bootout gui/$(id -u)/com.leofiber.conduit
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.leofiber.conduit.plist
-
-# Restart
-launchctl kickstart -k gui/$(id -u)/com.leofiber.conduit
-
-# Tail logs
-tail -f /tmp/conduit.log
-
-# Health check
-curl -s http://localhost:8081/v1/models | jq
+opencode --model cursor-proxy/kimi-k2.5
 ```
 
-## Troubleshooting
+Or use the helper that re-checks Cursor auth and ensures the proxy is up:
 
-**Proxy not responding**
 ```bash
-launchctl list | grep conduit         # status (PID + last exit code)
-tail -50 /tmp/conduit.log              # check the log
-launchctl kickstart -k gui/$(id -u)/com.leofiber.conduit
+conduit-cursor-run
 ```
 
-**`401 Not authenticated` / token expired**
+## Configuration
+
+Environment variables understood by `bin/conduit-cursor-proxy`:
+
+| variable                  | default              | meaning                                   |
+| ------------------------- | -------------------- | ----------------------------------------- |
+| `CONDUIT_CURSOR_PORT`     | `8091`               | listen port                               |
+| `AGENT_BIN`               | `agent`              | standalone Cursor Agent binary            |
+| `CURSOR_BIN`              | `cursor`             | fallback (`cursor agent ...`)             |
+| `CURSOR_MODEL`            | `kimi-k2.5`          | model used when request omits `model`     |
+| `CONDUIT_CURSOR_WORKSPACE`| `$HOME`              | workspace for the spawned agent           |
+| `CONDUIT_FORCE_TOOLS`     | `1`                  | pass `--force` to agent (auto-approve)    |
+| `CONDUIT_LOG_REQUESTS`    | unset                | if `1`, log inbound requests to a file    |
+
+The workspace can also be set per-request via:
+
+- HTTP header `X-Conduit-Workspace: /path/to/repo`
+- request body fields `workspace`, `metadata.workspace`, or `user`
+
+## Tests
+
+A full end-to-end suite lives at `tests/e2e.sh`:
+
 ```bash
-codex login    # re-auth in browser; conduit will pick up the new tokens immediately
+bash tests/e2e.sh
 ```
 
-**Cost shows $0.00 in opencode**
-That's not Conduit — opencode doesn't have a price-per-token table for the `codex-proxy/...` model ids. Token *counts* are accurate; only the dollar conversion is missing. Since this is a flat-rate Business/Enterprise plan, the dollar number isn't really meaningful anyway.
+It exercises the proxy through `opencode` against a clean
+`/tmp/conduit-e2e` workspace and verifies each tool category produces the
+expected real filesystem effect (file written, file deleted, MCP tool
+returns its runtime-loaded secret, etc.).
 
-**Default model in opencode**
-Set `"model": "codex-proxy/gpt-5.5"` in `~/.config/opencode/opencode.json`, or pass `--model codex-proxy/gpt-5.5` at runtime.
+To exercise MCP, the test installs a tiny stdio MCP server
+(`tests/echo-mcp.py`) into `<workspace>/.cursor/mcp.json` and approves it via
+`agent mcp enable conduit-echo`.
+
+## Why a local proxy at all
+
+Cursor Agent does **not** expose an OpenAI-compatible API. It emits its own
+NDJSON event stream. opencode expects an OpenAI-compatible backend. Conduit is
+the translation layer:
+
+`opencode → conduit-cursor-proxy → agent (Cursor)`
 
 ## Uninstall
 
@@ -146,20 +149,5 @@ Set `"model": "codex-proxy/gpt-5.5"` in `~/.config/opencode/opencode.json`, or p
 curl -fsSL https://raw.githubusercontent.com/leofiber/conduit/main/uninstall.sh | bash
 ```
 
-This removes the launchd agent, binaries, and the `codex-proxy` provider from your opencode config. It does **not** touch your Codex login (`~/.codex/auth.json`) or the `codex` / `opencode` CLIs themselves.
-
-## A note on Terms of Service
-
-Conduit uses **your own** Codex tokens, obtained legitimately via `codex login` — the same way the official Codex CLI uses them. Requests go to the same backend, billed against the same plan; there's no scope escalation, no third-party token transfer, no rate-limit circumvention. The only "novel" thing is which client makes the request.
-
-That said, this is unofficial. OpenAI hasn't published a public spec for the Codex backend, so nothing here is a stable contract. If you're at a company that needs a defensible answer, ask your infosec / legal team before deploying widely.
-
-## Caveats
-
-- **macOS only** for now (uses `launchd`). Linux port would need a `systemd --user` unit; PRs welcome.
-- The Codex backend (`/codex/responses`) is private and undocumented — fields and event types could change without warning. If something breaks, file an issue.
-- This is not affiliated with OpenAI in any way.
-
-## License
-
-MIT - see `LICENSE`.
+This removes Conduit's launchd job, binaries, and the `cursor-proxy` provider
+entry from your opencode config. It does **not** log you out of Cursor.

@@ -1,0 +1,979 @@
+#!/usr/bin/env python3
+"""
+Conduit Cursor Proxy
+
+Expose Cursor Agent as a minimal OpenAI-compatible backend for opencode.
+
+Implementation: shells out to the standalone `agent` CLI in
+`--print --output-format stream-json` mode and translates the resulting NDJSON
+events into OpenAI Chat Completions responses (streaming or non-streaming).
+
+Cursor's agent is itself a full agent runtime with its own tools (read/write/
+edit/grep/ls/shell/web_search/MCP/subagents). We let Cursor perform tool
+execution in the workspace and surface its outputs to opencode as assistant
+content (and, for streaming, also as `reasoning_content` deltas for thinking
+and human-readable tool activity markers).
+
+Environment:
+  CONDUIT_CURSOR_PORT      - local listen port (default 8091)
+  AGENT_BIN                - standalone agent executable (default: agent)
+  CURSOR_BIN               - cursor executable fallback (default: cursor)
+  CURSOR_MODEL             - default model when request omits model
+  CONDUIT_CURSOR_WORKSPACE - default workspace dir when no header is set
+  CONDUIT_LOG_REQUESTS     - if "1", log inbound requests to a temp file
+  CONDUIT_FORCE_TOOLS      - if "1" (default), pass --force to agent so all
+                              tool calls are auto-approved
+"""
+
+import base64
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import threading
+import time
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
+
+
+PORT = int(os.environ.get("CONDUIT_CURSOR_PORT", "8091"))
+AGENT_BIN = os.environ.get("AGENT_BIN", "agent")
+CURSOR_BIN = os.environ.get("CURSOR_BIN", "cursor")
+DEFAULT_MODEL = os.environ.get("CURSOR_MODEL", "kimi-k2.5")
+DEFAULT_WORKSPACE = os.environ.get("CONDUIT_CURSOR_WORKSPACE") or os.getcwd()
+LOG_REQUESTS = os.environ.get("CONDUIT_LOG_REQUESTS") == "1"
+REQUEST_LOG = "/tmp/conduit-cursor-requests.log"
+FORCE_TOOLS = os.environ.get("CONDUIT_FORCE_TOOLS", "1") == "1"
+SHORTCIRCUIT_TITLES = os.environ.get("CONDUIT_SHORTCIRCUIT_TITLES", "1") == "1"
+RESUME_SESSIONS = os.environ.get("CONDUIT_RESUME_SESSIONS", "1") == "1"
+
+# Cache: hash(prior turns) -> last cursor-agent session id we got back. Used so
+# follow-up turns in the same conversation can `--resume <id>` and only send
+# the latest user message instead of cold-spawning a fresh agent that has to
+# re-read the entire transcript.
+_SESSION_CACHE = {}
+_SESSION_CACHE_LOCK = threading.Lock()
+_SESSION_CACHE_MAX = 256
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _resolve_agent_command():
+    """Prefer standalone `agent`; fall back to `cursor agent`."""
+    if shutil.which(AGENT_BIN):
+        return [AGENT_BIN]
+    if shutil.which(CURSOR_BIN):
+        return [CURSOR_BIN, "agent"]
+    return None
+
+
+def _json_body(handler, status, payload):
+    body = json.dumps(payload).encode()
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Connection", "close")
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def _error(handler, status, message, code=None):
+    _json_body(handler, status, {
+        "error": {
+            "message": message,
+            "type": "api_error",
+            "code": code or str(status),
+        }
+    })
+
+
+def _list_models():
+    agent_cmd = _resolve_agent_command()
+    if not agent_cmd:
+        return None, "neither standalone 'agent' nor 'cursor' CLI found on PATH"
+    try:
+        proc = subprocess.run(
+            [*agent_cmd, "models"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except FileNotFoundError:
+        return None, "agent CLI not found on PATH"
+    except Exception as e:  # pragma: no cover
+        return None, f"failed to run agent models: {e}"
+
+    if proc.returncode != 0:
+        return None, f"agent models failed: {proc.stderr.strip() or proc.stdout.strip()}"
+
+    models = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line or line.startswith("Available models"):
+            continue
+        if " - " not in line:
+            continue
+        model_id, rest = line.split(" - ", 1)
+        models.append({
+            "id": model_id.strip(),
+            "object": "model",
+            "created": 1700000000,
+            "owned_by": "cursor",
+            "display_name": rest.replace("(current)", "").strip(),
+        })
+    return models, None
+
+
+# ---------------------------------------------------------------------------
+# Request -> agent prompt
+# ---------------------------------------------------------------------------
+
+
+def _save_data_url_to_file(url, workdir):
+    if not url.startswith("data:"):
+        return None
+    try:
+        header, b64 = url.split(",", 1)
+        mime = header.split(";", 1)[0][5:]
+        ext = {
+            "image/png": ".png",
+            "image/jpeg": ".jpg",
+            "image/webp": ".webp",
+            "image/gif": ".gif",
+        }.get(mime, ".bin")
+        raw = base64.b64decode(b64)
+        fd, path = tempfile.mkstemp(prefix="conduit-cursor-img-", suffix=ext, dir=workdir)
+        os.close(fd)
+        with open(path, "wb") as f:
+            f.write(raw)
+        return path
+    except Exception:
+        return None
+
+
+def _messages_to_agent_prompt(messages, workdir):
+    """Collapse OpenAI-style messages into a single prompt for the agent CLI.
+
+    The agent CLI is its own full agent runtime; we hand it a structured
+    transcript plus any image attachments saved into the workspace.
+    """
+    system_parts = []
+    transcript = []
+    saved_files = []
+
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+
+        if role == "system":
+            if isinstance(content, str):
+                system_parts.append(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        system_parts.append(part.get("text", ""))
+            continue
+
+        if role == "tool":
+            transcript.append(
+                f"[tool result for {msg.get('tool_call_id','unknown')}]\n{content}"
+            )
+            continue
+
+        if role == "assistant" and msg.get("tool_calls"):
+            tc_lines = []
+            for tc in msg["tool_calls"]:
+                fn = tc.get("function", {})
+                tc_lines.append(
+                    f"tool_call id={tc.get('id','')} "
+                    f"name={fn.get('name','')} "
+                    f"args={fn.get('arguments','')}"
+                )
+            transcript.append("[assistant tool calls]\n" + "\n".join(tc_lines))
+
+        if isinstance(content, str):
+            transcript.append(f"[{role}]\n{content}")
+            continue
+
+        if isinstance(content, list):
+            text_chunks = []
+            image_files = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                ptype = part.get("type")
+                if ptype == "text":
+                    text_chunks.append(part.get("text", ""))
+                elif ptype == "image_url":
+                    url = (part.get("image_url") or {}).get("url", "")
+                    saved = _save_data_url_to_file(url, workdir)
+                    if saved:
+                        image_files.append(saved)
+                        saved_files.append(saved)
+                elif ptype == "image_file":
+                    path = part.get("path") or part.get("file_path") or ""
+                    if path:
+                        image_files.append(path)
+            body = "\n".join([t for t in text_chunks if t])
+            if image_files:
+                body += (
+                    "\n\nAttached image files in workspace:\n"
+                    + "\n".join(image_files)
+                    + "\nPlease inspect those image files directly from disk if relevant."
+                )
+            transcript.append(f"[{role}]\n{body}")
+            continue
+
+    system = "\n\n".join([x for x in system_parts if x]).strip()
+    prompt = ""
+    if system:
+        prompt += f"SYSTEM INSTRUCTIONS:\n{system}\n\n"
+    prompt += "CONVERSATION TRANSCRIPT:\n\n" + "\n\n".join(transcript)
+    return prompt.strip(), saved_files
+
+
+# ---------------------------------------------------------------------------
+# Tool-call rendering
+# ---------------------------------------------------------------------------
+
+
+_TOOL_LABELS = {
+    "readToolCall": "Read",
+    "writeToolCall": "Write",
+    "editToolCall": "Edit",
+    "multiEditToolCall": "MultiEdit",
+    "deleteToolCall": "Delete",
+    "shellToolCall": "Shell",
+    "backgroundShellToolCall": "BackgroundShell",
+    "writeShellStdinToolCall": "WriteShellStdin",
+    "grepToolCall": "Grep",
+    "globToolCall": "Glob",
+    "lsToolCall": "Ls",
+    "fetchToolCall": "Fetch",
+    "webSearchToolCall": "WebSearch",
+    "webFetchToolCall": "WebFetch",
+    "diagnosticsToolCall": "Diagnostics",
+    "mcpToolCall": "Mcp",
+    "taskToolCall": "Task",
+    "subagentToolCall": "Subagent",
+    "askQuestionToolCall": "AskQuestion",
+    "generateImageToolCall": "GenerateImage",
+    "createPlanToolCall": "CreatePlan",
+    "executePlanToolCall": "ExecutePlan",
+    "todoWriteToolCall": "TodoWrite",
+    "setActiveBranchToolCall": "SetActiveBranch",
+    "prManagementToolCall": "PrManagement",
+    "computerUseToolCall": "ComputerUse",
+    "recordScreenToolCall": "RecordScreen",
+    "executeHookToolCall": "ExecuteHook",
+    "smartModeClassifierToolCall": "SmartModeClassifier",
+    "mcpAuthToolCall": "McpAuth",
+    "replaceEnvToolCall": "ReplaceEnv",
+    "setupVmEnvironmentToolCall": "SetupVmEnvironment",
+    "switchModeToolCall": "SwitchMode",
+}
+
+
+def _tool_label_from_event(ev):
+    tool_call = ev.get("tool_call") or {}
+    for key in tool_call:
+        if key in _TOOL_LABELS:
+            return _TOOL_LABELS[key], key
+    return "Tool", None
+
+
+def _short_args_summary(args):
+    if not isinstance(args, dict):
+        return ""
+    keys_in_order = [
+        "path",
+        "globPattern",
+        "pattern",
+        "command",
+        "url",
+        "query",
+        "name",
+        "shellId",
+        "filePath",
+        "fileText",
+        "newString",
+        "oldString",
+    ]
+    parts = []
+    for k in keys_in_order:
+        if k in args and args[k] not in (None, ""):
+            v = args[k]
+            if isinstance(v, str) and len(v) > 120:
+                v = v[:120] + "…"
+            parts.append(f"{k}={v}")
+    if not parts:
+        # Best effort: serialize a few keys.
+        for k, v in list(args.items())[:3]:
+            if isinstance(v, (str, int, float, bool)):
+                if isinstance(v, str) and len(v) > 120:
+                    v = v[:120] + "…"
+                parts.append(f"{k}={v}")
+    return ", ".join(parts)
+
+
+def _format_tool_started(ev):
+    label, key = _tool_label_from_event(ev)
+    args_block = (ev.get("tool_call") or {}).get(key, {}).get("args", {}) if key else {}
+    summary = _short_args_summary(args_block)
+    call_id = ev.get("call_id") or ""
+    line = f"\n[tool:{label}] {summary}".rstrip()
+    if call_id:
+        line += f"  (id={call_id})"
+    return line + "\n"
+
+
+def _format_tool_completed(ev):
+    label, key = _tool_label_from_event(ev)
+    call_id = ev.get("call_id") or ""
+
+
+# ---------------------------------------------------------------------------
+# Latency fast paths
+# ---------------------------------------------------------------------------
+
+
+def _is_title_request(req, messages):
+    """Detect opencode's "title generator" side-call so we don't spawn a whole
+    Cursor turn just to come up with a thread label.
+
+    opencode hard-codes the system prompt: "You are a title generator. You
+    output ONLY a thread title. Nothing else." We pattern-match on that.
+    """
+    if not SHORTCIRCUIT_TITLES:
+        return False
+    try:
+        sys_msgs = [m.get("content", "") for m in messages if m.get("role") == "system"]
+    except Exception:
+        return False
+    for content in sys_msgs:
+        if isinstance(content, list):
+            content = " ".join(
+                p.get("text", "") for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            )
+        if isinstance(content, str) and "title generator" in content.lower():
+            return True
+    return False
+
+
+def _synth_title(messages):
+    last_user = ""
+    for m in messages:
+        if m.get("role") == "user":
+            c = m.get("content")
+            if isinstance(c, str):
+                last_user = c
+            elif isinstance(c, list):
+                last_user = " ".join(
+                    p.get("text", "") for p in c
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+    last_user = re.sub(r"\s+", " ", last_user).strip().strip('"').strip()
+    if not last_user:
+        return "New conversation"
+    title = last_user[:50].rstrip()
+    if len(last_user) > 50:
+        title = title.rstrip(",.;:- ") + "…"
+    return title
+
+
+def _serve_title(handler, req, messages, response_id, created_ts, model):
+    """Return a synthetic completion for opencode's title side-call without
+    touching Cursor."""
+    title = _synth_title(messages)
+    usage = {
+        "prompt_tokens": 0,
+        "completion_tokens": len(title.split()),
+        "total_tokens": len(title.split()),
+        "prompt_tokens_details": {"cached_tokens": 0},
+        "completion_tokens_details": {"reasoning_tokens": 0},
+    }
+    if bool(req.get("stream", False)):
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream")
+        handler.send_header("Cache-Control", "no-cache")
+        handler.send_header("Transfer-Encoding", "chunked")
+        handler.send_header("Connection", "keep-alive")
+        handler.end_headers()
+        initial = {
+            "id": response_id, "object": "chat.completion.chunk",
+            "created": created_ts, "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": title},
+                "finish_reason": None,
+            }],
+        }
+        final = {
+            "id": response_id, "object": "chat.completion.chunk",
+            "created": created_ts, "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": usage,
+        }
+        try:
+            _sse_chunk(handler, json.dumps(initial))
+            _sse_chunk(handler, json.dumps(final))
+            _sse_done(handler)
+        except Exception:
+            pass
+        return
+    payload = {
+        "id": response_id, "object": "chat.completion",
+        "created": created_ts, "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": title},
+            "finish_reason": "stop",
+        }],
+        "usage": usage,
+    }
+    return _json_body(handler, 200, payload)
+
+
+def _hash_messages(messages):
+    """Stable hash of all but the last user message - identifies a conversation
+    so follow-up turns can resume the same Cursor session."""
+    if not messages:
+        return None
+    cutoff = len(messages)
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "user":
+            cutoff = i
+            break
+    if cutoff == 0:
+        return None
+    h = hashlib.sha256()
+    for m in messages[:cutoff]:
+        try:
+            h.update(json.dumps(m, sort_keys=True, default=str).encode())
+            h.update(b"\x1f")
+        except Exception:
+            pass
+    return h.hexdigest()
+
+
+def _last_user_message_text(messages, workdir):
+    """Return the text of the most recent user message, with images saved to
+    workspace and referenced inline (matches the format the existing transcript
+    builder uses)."""
+    last = None
+    for m in messages:
+        if m.get("role") == "user":
+            last = m
+    if last is None:
+        return "", []
+    saved = []
+    content = last.get("content", "")
+    if isinstance(content, str):
+        return content, saved
+    chunks = []
+    images = []
+    for part in content if isinstance(content, list) else []:
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get("type")
+        if ptype == "text":
+            chunks.append(part.get("text", ""))
+        elif ptype == "image_url":
+            url = (part.get("image_url") or {}).get("url", "")
+            p = _save_data_url_to_file(url, workdir)
+            if p:
+                images.append(p)
+                saved.append(p)
+        elif ptype == "image_file":
+            p = part.get("path") or part.get("file_path") or ""
+            if p:
+                images.append(p)
+    body = "\n".join(t for t in chunks if t)
+    if images:
+        body += (
+            "\n\nAttached image files in workspace:\n"
+            + "\n".join(images)
+            + "\nPlease inspect those image files directly from disk if relevant."
+        )
+    return body, saved
+
+
+def _cache_session(conv_hash, session_id):
+    if not (RESUME_SESSIONS and conv_hash and session_id):
+        return
+    with _SESSION_CACHE_LOCK:
+        _SESSION_CACHE[conv_hash] = session_id
+        if len(_SESSION_CACHE) > _SESSION_CACHE_MAX:
+            for k in list(_SESSION_CACHE)[: len(_SESSION_CACHE) - _SESSION_CACHE_MAX]:
+                _SESSION_CACHE.pop(k, None)
+
+
+def _lookup_session(conv_hash):
+    if not (RESUME_SESSIONS and conv_hash):
+        return None
+    with _SESSION_CACHE_LOCK:
+        return _SESSION_CACHE.get(conv_hash)
+    return f"[tool:{label}:done id={call_id}]\n"
+
+
+# ---------------------------------------------------------------------------
+# OpenAI streaming helpers
+# ---------------------------------------------------------------------------
+
+
+def _sse_chunk(handler, payload_json):
+    data = f"data: {payload_json}\n\n".encode()
+    handler.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
+    handler.wfile.flush()
+
+
+def _sse_done(handler):
+    final = b"data: [DONE]\n\n"
+    handler.wfile.write(f"{len(final):x}\r\n".encode() + final + b"\r\n")
+    handler.wfile.write(b"0\r\n\r\n")
+    handler.wfile.flush()
+
+
+# ---------------------------------------------------------------------------
+# HTTP handler
+# ---------------------------------------------------------------------------
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        print(f"[{self.log_date_time_string()}] {fmt % args}")
+
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
+            self.close_connection = True
+        except Exception as e:
+            print(f"request handler error: {e}")
+            self.close_connection = True
+
+    # -- GET ----------------------------------------------------------------
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/v1/models":
+            models, err = _list_models()
+            if err:
+                return _error(self, 500, err)
+            return _json_body(self, 200, {"object": "list", "data": models})
+        if path == "/healthz":
+            return _json_body(self, 200, {"status": "ok"})
+        return _error(self, 404, "Not found")
+
+    # -- POST ---------------------------------------------------------------
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path != "/v1/chat/completions":
+            return _error(self, 404, "Not found")
+
+        agent_cmd = _resolve_agent_command()
+        if not agent_cmd:
+            return _error(self, 500, "Neither standalone 'agent' nor 'cursor' CLI found on PATH")
+
+        content_length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(content_length)
+
+        if LOG_REQUESTS:
+            try:
+                with open(REQUEST_LOG, "a") as f:
+                    f.write(f"\n=== {time.time()} ({content_length} bytes) ===\n")
+                    f.write(raw.decode("utf-8", errors="replace")[:12000])
+                    f.write("\n")
+            except Exception:
+                pass
+
+        try:
+            req = json.loads(raw)
+        except Exception:
+            return _error(self, 400, "Invalid JSON")
+
+        model = req.get("model") or DEFAULT_MODEL
+        client_stream = bool(req.get("stream", False))
+        messages = req.get("messages", [])
+        response_id = f"chatcmpl-{int(time.time()*1000)}-{uuid.uuid4().hex[:6]}"
+        created_ts = int(time.time())
+
+        # Fast path #1: opencode's per-thread title side-call. Don't burn a
+        # whole Cursor turn (~10s cold spawn) just to come up with a label.
+        if _is_title_request(req, messages):
+            return _serve_title(self, req, messages, response_id, created_ts, model)
+
+        workdir = (
+            self.headers.get("X-Conduit-Workspace")
+            or req.get("workspace")
+            or (req.get("metadata") or {}).get("workspace")
+            or req.get("user")
+            or DEFAULT_WORKSPACE
+        )
+        if not isinstance(workdir, str) or not os.path.isdir(workdir):
+            workdir = DEFAULT_WORKSPACE
+
+        # Fast path #2: if we've already driven this exact conversation prefix
+        # through Cursor before, reuse the cursor-agent session id and just
+        # send the latest user turn instead of replaying the whole transcript.
+        conv_hash = _hash_messages(messages)
+        resume_id = _lookup_session(conv_hash)
+        if resume_id:
+            prompt, temp_files = _last_user_message_text(messages, workdir)
+            if not prompt.strip():
+                resume_id = None
+        if not resume_id:
+            prompt, temp_files = _messages_to_agent_prompt(messages, workdir)
+
+        cmd = [
+            *agent_cmd,
+            "--print",
+            "--output-format",
+            "stream-json",
+            "--trust",
+            "--workspace",
+            workdir,
+            "--model",
+            model,
+        ]
+        if FORCE_TOOLS:
+            cmd.append("--force")
+        if resume_id:
+            cmd += ["--resume", resume_id]
+        cmd.append(prompt)
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                cwd=workdir,
+            )
+        except Exception as e:
+            return _error(self, 500, f"failed to start agent: {e}")
+
+        full_text = ""
+        reasoning = ""
+        agent_session_id = None
+        usage = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "prompt_tokens_details": {"cached_tokens": 0},
+            "completion_tokens_details": {"reasoning_tokens": 0},
+        }
+
+        if client_stream:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+
+            initial = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created_ts,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": ""},
+                    "finish_reason": None,
+                }],
+            }
+            try:
+                _sse_chunk(self, json.dumps(initial))
+            except Exception:
+                proc.kill()
+                self._cleanup(temp_files)
+                return
+
+        # Read stderr asynchronously so we can surface errors without
+        # blocking on stdout.
+        stderr_buf = []
+
+        def read_stderr_async(p, bucket):
+            try:
+                err = p.stderr.read()
+                if err:
+                    bucket.append(err)
+            except Exception:
+                pass
+
+        t = threading.Thread(target=read_stderr_async, args=(proc, stderr_buf), daemon=True)
+        t.start()
+
+        finished_normally = False
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except Exception:
+                    continue
+                etype = ev.get("type")
+                subtype = ev.get("subtype")
+
+                if etype == "system" and subtype == "init":
+                    sid = ev.get("session_id")
+                    if isinstance(sid, str) and sid:
+                        agent_session_id = sid
+                    continue
+
+                if etype == "thinking" and subtype == "delta":
+                    delta = ev.get("text", "")
+                    reasoning += delta
+                    if client_stream:
+                        chunk = {
+                            "id": response_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_ts,
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {
+                                    "reasoning_content": delta,
+                                    "reasoning": delta,
+                                },
+                                "finish_reason": None,
+                            }],
+                        }
+                        try:
+                            _sse_chunk(self, json.dumps(chunk))
+                        except Exception:
+                            proc.kill()
+                            self._cleanup(temp_files)
+                            return
+                    continue
+
+                if etype == "tool_call":
+                    if subtype == "started":
+                        marker = _format_tool_started(ev)
+                    elif subtype == "completed":
+                        marker = _format_tool_completed(ev)
+                    else:
+                        marker = ""
+                    if marker:
+                        reasoning += marker
+                        if client_stream:
+                            chunk = {
+                                "id": response_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_ts,
+                                "model": model,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {
+                                        "reasoning_content": marker,
+                                        "reasoning": marker,
+                                    },
+                                    "finish_reason": None,
+                                }],
+                            }
+                            try:
+                                _sse_chunk(self, json.dumps(chunk))
+                            except Exception:
+                                proc.kill()
+                                self._cleanup(temp_files)
+                                return
+                    continue
+
+                if etype == "assistant":
+                    msg = ev.get("message") or {}
+                    content_pieces = []
+                    for part in msg.get("content", []) or []:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            content_pieces.append(part.get("text", ""))
+                    content = "".join(content_pieces)
+                    if content:
+                        full_text += content
+                        if client_stream:
+                            chunk = {
+                                "id": response_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_ts,
+                                "model": model,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"content": content},
+                                    "finish_reason": None,
+                                }],
+                            }
+                            try:
+                                _sse_chunk(self, json.dumps(chunk))
+                            except Exception:
+                                proc.kill()
+                                self._cleanup(temp_files)
+                                return
+                    continue
+
+                if etype == "result":
+                    sid = ev.get("session_id")
+                    if isinstance(sid, str) and sid:
+                        agent_session_id = sid
+                    u = ev.get("usage") or {}
+                    usage = {
+                        "prompt_tokens": u.get("inputTokens", 0),
+                        "completion_tokens": u.get("outputTokens", 0),
+                        "total_tokens": u.get("inputTokens", 0) + u.get("outputTokens", 0),
+                        "prompt_tokens_details": {"cached_tokens": u.get("cacheReadTokens", 0)},
+                        "completion_tokens_details": {"reasoning_tokens": 0},
+                    }
+                    # If for some reason no assistant text was emitted but a
+                    # final string was provided, fall back to it.
+                    if not full_text and isinstance(ev.get("result"), str):
+                        full_text = ev["result"]
+                        if client_stream:
+                            chunk = {
+                                "id": response_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_ts,
+                                "model": model,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"content": full_text},
+                                    "finish_reason": None,
+                                }],
+                            }
+                            try:
+                                _sse_chunk(self, json.dumps(chunk))
+                            except Exception:
+                                pass
+                    continue
+
+            finished_normally = True
+        finally:
+            try:
+                rc = proc.wait(timeout=10)
+            except Exception:
+                rc = -1
+            self._cleanup(temp_files)
+
+        # Cache the cursor-agent session id so a follow-up turn in this
+        # conversation can `--resume <id>` and skip re-sending the transcript.
+        # Keyed by the *inclusive* hash of all messages we just sent, so the
+        # next opencode call (which appends its own assistant reply + new user
+        # message) will look up under our previous inclusive hash via its own
+        # prefix-hash and find the same Cursor session id.
+        #
+        # The "previous prefix" hash (already used for THIS turn's lookup) is
+        # also stored so a chat that replays a known prefix again still finds
+        # the same session.
+        if agent_session_id and full_text:
+            try:
+                inclusive = hashlib.sha256()
+                for m in messages:
+                    inclusive.update(json.dumps(m, sort_keys=True, default=str).encode())
+                    inclusive.update(b"\x1f")
+                # Important: synthesize what the NEXT-turn prefix will be:
+                # current messages + the assistant reply we just produced.
+                inclusive.update(json.dumps({"role": "assistant", "content": full_text}, sort_keys=True, default=str).encode())
+                inclusive.update(b"\x1f")
+                next_prefix_hash = inclusive.hexdigest()
+                _cache_session(next_prefix_hash, agent_session_id)
+            except Exception:
+                pass
+            if conv_hash:
+                _cache_session(conv_hash, agent_session_id)
+
+        if not finished_normally and rc != 0 and not full_text:
+            err_text = "\n".join(stderr_buf).strip() or f"agent exited with status {rc}"
+            if client_stream:
+                # Emit an error chunk so opencode sees something useful.
+                err_chunk = {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_ts,
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": f"\n[conduit error] {err_text}\n"},
+                        "finish_reason": "stop",
+                    }],
+                    "usage": usage,
+                }
+                try:
+                    _sse_chunk(self, json.dumps(err_chunk))
+                    _sse_done(self)
+                except Exception:
+                    pass
+                return
+            return _error(self, 500, err_text)
+
+        if client_stream:
+            final = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created_ts,
+                "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": usage,
+            }
+            try:
+                _sse_chunk(self, json.dumps(final))
+                _sse_done(self)
+            except Exception:
+                pass
+            return
+
+        message = {"role": "assistant", "content": full_text}
+        if reasoning:
+            message["reasoning_content"] = reasoning
+            message["reasoning"] = reasoning
+        payload = {
+            "id": response_id,
+            "object": "chat.completion",
+            "created": created_ts,
+            "model": model,
+            "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
+            "usage": usage,
+        }
+        return _json_body(self, 200, payload)
+
+    # -- helpers ------------------------------------------------------------
+
+    def _cleanup(self, temp_files):
+        for p in temp_files or []:
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
+
+
+def main():
+    agent_cmd = _resolve_agent_command()
+    if not agent_cmd:
+        print(f"⚠  Neither '{AGENT_BIN}' nor '{CURSOR_BIN}' is available on PATH")
+        print("   Install Cursor Agent / Cursor CLI and ensure the command is on PATH before starting this proxy.")
+    else:
+        print(f"✓ Conduit Cursor proxy listening on http://localhost:{PORT}")
+        print(f"  OpenAI-compatible base URL: http://localhost:{PORT}/v1")
+        print(f"  Backend: Cursor Agent ({' '.join(agent_cmd)})")
+
+    server = ThreadingHTTPServer(("localhost", PORT), Handler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nshutting down")
+        server.shutdown()
+
+
+if __name__ == "__main__":
+    main()
