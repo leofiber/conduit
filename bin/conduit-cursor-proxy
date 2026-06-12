@@ -868,19 +868,30 @@ class Handler(BaseHTTPRequestHandler):
 
         # Cache the cursor-agent session id so a follow-up turn in this
         # conversation can `--resume <id>` and skip re-sending the transcript.
-        if conv_hash and agent_session_id and full_text:
-            # Index by both the prefix-hash (for follow-ups: prior turns) and
-            # the inclusive-hash (so a chat that replays the same prefix again
-            # still resumes correctly).
-            _cache_session(conv_hash, agent_session_id)
+        # Keyed by the *inclusive* hash of all messages we just sent, so the
+        # next opencode call (which appends its own assistant reply + new user
+        # message) will look up under our previous inclusive hash via its own
+        # prefix-hash and find the same Cursor session id.
+        #
+        # The "previous prefix" hash (already used for THIS turn's lookup) is
+        # also stored so a chat that replays a known prefix again still finds
+        # the same session.
+        if agent_session_id and full_text:
             try:
                 inclusive = hashlib.sha256()
                 for m in messages:
                     inclusive.update(json.dumps(m, sort_keys=True, default=str).encode())
                     inclusive.update(b"\x1f")
-                _cache_session(inclusive.hexdigest(), agent_session_id)
+                # Important: synthesize what the NEXT-turn prefix will be:
+                # current messages + the assistant reply we just produced.
+                inclusive.update(json.dumps({"role": "assistant", "content": full_text}, sort_keys=True, default=str).encode())
+                inclusive.update(b"\x1f")
+                next_prefix_hash = inclusive.hexdigest()
+                _cache_session(next_prefix_hash, agent_session_id)
             except Exception:
                 pass
+            if conv_hash:
+                _cache_session(conv_hash, agent_session_id)
 
         if not finished_normally and rc != 0 and not full_text:
             err_text = "\n".join(stderr_buf).strip() or f"agent exited with status {rc}"

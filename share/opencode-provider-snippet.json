@@ -9,22 +9,30 @@
       "auto": {
         "name": "Cursor Auto",
         "tool_call": false,
-        "reasoning": true
+        "reasoning": true,
+        "limit": { "context": 200000, "output": 32000 },
+        "cost": { "input": 0, "output": 0, "cache_read": 0 }
       },
       "composer-2.5": {
         "name": "Composer 2.5",
         "tool_call": false,
-        "reasoning": true
+        "reasoning": true,
+        "limit": { "context": 200000, "output": 32000 },
+        "cost": { "input": 1.25, "output": 10.0, "cache_read": 0.125 }
       },
       "gemini-3-flash": {
         "name": "Gemini 3 Flash",
         "tool_call": false,
-        "reasoning": true
+        "reasoning": true,
+        "limit": { "context": 1000000, "output": 65000 },
+        "cost": { "input": 0.30, "output": 2.50, "cache_read": 0.0375 }
       },
       "kimi-k2.5": {
         "name": "Kimi K2.5",
         "tool_call": false,
-        "reasoning": true
+        "reasoning": true,
+        "limit": { "context": 256000, "output": 32000 },
+        "cost": { "input": 0.60, "output": 2.50, "cache_read": 0.06 }
       }
     }
   }
